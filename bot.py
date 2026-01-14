@@ -11,8 +11,8 @@ from telegram.ext import (
     ContextTypes,
 )
 
-BOT_TOKEN = os.getenv("8132009354:AAGLa-XWYqNQp9tO8MJ_-leVoUm4uAlLiiw", "")
-ADMIN_CHAT_ID = int(os.getenv("8155012442", "0"))
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 
 # --- Каталог товарів ---
 CATALOG = {
