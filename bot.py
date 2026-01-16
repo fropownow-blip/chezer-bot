@@ -1,13 +1,14 @@
 import os
-import json
-from typing import Dict, Any, Tuple
+import sqlite3
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
 )
-from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -15,375 +16,475 @@ from telegram.ext import (
     ContextTypes,
 )
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
+# =======================
+# ENV (Render / локально)
+# =======================
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "0"))
+PHOTO_URL = os.environ.get("PHOTO_URL", "").strip()  # опціонально
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is empty. Set environment variable BOT_TOKEN.")
-if ADMIN_CHAT_ID == 0:
-    raise RuntimeError("ADMIN_CHAT_ID is empty. Set environment variable ADMIN_CHAT_ID (your numeric Telegram id).")
+if not ADMIN_CHAT_ID:
+    raise RuntimeError("ADMIN_CHAT_ID is empty. Set environment variable ADMIN_CHAT_ID (your Telegram ID).")
 
-# -----------------------------
-# Налаштування товарів
-# -----------------------------
+DB_PATH = os.environ.get("DB_PATH", "bot.db")
 
-# Ключ товару: (об'єм, смак)
-# Об'єм: "30" або "10"
-FLAVORS = [
-    ("вишня ментол", "Вишня + ментоловий холодок. Соковито і свіже."),
-    ("кавун ментол", "Кавун + холодок. Легкий і дуже освіжаючий."),
-    ("банан", "Солодкий банан. М’який післясмак."),
-    ("мята", "Чиста м'ята. Холодна класика."),
-    ("ківі", "Ківі з кислинкою. Яскравий смак."),
-    ("блакитна малина", "Blue Raspberry. Кисло-солодко, топчик."),
+# =======================
+# DATA
+# =======================
+@dataclass(frozen=True)
+class Flavor:
+    id: int
+    name: str
+    tag: str  # "", "NEW", "LIMITED"
+    desc: str
+
+FLAVORS: List[Flavor] = [
+    Flavor(1,  "ЧЕРЕШНЯ",            "NEW",     "Солодка черешня з яскравим ягідним профілем."),
+    Flavor(2,  "ГРЕЙПФРУТ",          "LIMITED", "Соковитий грейпфрут із легкою гірчинкою."),
+    Flavor(3,  "КАКТУС",             "LIMITED", "Екзотичний кактус, освіжаючий та незвичний."),
+    Flavor(4,  "ЛІЧІ",               "LIMITED", "Ніжний солодкий лічі з фруктовим післясмаком."),
+    Flavor(5,  "ВИНОГРАД",           "",        "Стиглий солодкий виноград."),
+    Flavor(6,  "ВИШНЯ",              "",        "Класична соковита вишня."),
+    Flavor(7,  "ВИШНЯ МЕНТОЛ",       "",        "Вишня + холодок ментолу."),
+    Flavor(8,  "ГРАНАТ",             "",        "Насичений кисло-солодкий гранат."),
+    Flavor(9,  "ДИНЯ",               "",        "Солодка стигла диня."),
+    Flavor(10, "ЖОВТА МАЛИНА",       "",        "Ніжна жовта малина, солодко-ягідна."),
+    Flavor(11, "ЖОВТА ЧЕРЕШНЯ",      "",        "М’яка солодка жовта черешня."),
+    Flavor(12, "ЖОВТИЙ ДРАГОНФРУТ",  "",        "Екзотичний драгонфрут з фруктовою свіжістю."),
+    Flavor(13, "КАВУН",              "",        "Літній соковитий кавун."),
+    Flavor(14, "КАВУН МЕНТОЛ",       "",        "Кавун + ментоловий холодок."),
+    Flavor(15, "ЛИМОН",              "",        "Яскравий цитрусовий лимон."),
+    Flavor(16, "КІВІ",               "",        "Кисло-солодкий ківі."),
+    Flavor(17, "М'ЯТА",              "",        "Чиста м’ята, максимально свіжа."),
+    Flavor(18, "ПЕРСИК",             "",        "Ніжний солодкий персик."),
+    Flavor(19, "ПОЛУНИЦЯ",           "",        "Соковита солодка полуниця."),
+    Flavor(20, "СМОРОДИНА МЕНТОЛ",   "",        "Смородина + холодок."),
+    Flavor(21, "ЯГОДИ",              "",        "Мікс ягід: яскраво та насичено."),
 ]
 
-# Склад (ліміти). Можеш змінювати командами /setstock та /addstock
-# Формат: { "30|вишня ментол": 5, ... }
-DEFAULT_STOCK = {
-    f"30|{name}": 5 for (name, _) in FLAVORS
-} | {
-    f"10|{name}": 5 for (name, _) in FLAVORS
-}
+FLAVOR_BY_ID: Dict[int, Flavor] = {f.id: f for f in FLAVORS}
 
-STOCK_FILE = "stock.json"  # локальний файл. На Render може скидатись при новому деплої.
 
-def load_stock() -> Dict[str, int]:
-    try:
-        with open(STOCK_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        # гарантуємо, що всі ключі існують
-        for k, v in DEFAULT_STOCK.items():
-            data.setdefault(k, v)
-        # прибираємо зайве, але можна лишити — не критично
-        return {k: int(v) for k, v in data.items()}
-    except Exception:
-        return dict(DEFAULT_STOCK)
+# =======================
+# DB
+# =======================
+def db() -> sqlite3.Connection:
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    return con
 
-def save_stock(stock: Dict[str, int]) -> None:
-    try:
-        with open(STOCK_FILE, "w", encoding="utf-8") as f:
-            json.dump(stock, f, ensure_ascii=False, indent=2)
-    except Exception:
-        # якщо файлової системи нема/readonly — нічого, буде триматись у пам'яті
-        pass
+def init_db() -> None:
+    with db() as con:
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS stock (
+            flavor_id INTEGER PRIMARY KEY,
+            qty INTEGER NOT NULL
+        )
+        """)
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS carts (
+            user_id INTEGER NOT NULL,
+            flavor_id INTEGER NOT NULL,
+            qty INTEGER NOT NULL,
+            PRIMARY KEY (user_id, flavor_id)
+        )
+        """)
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """)
+        # default stock if empty
+        cur = con.execute("SELECT COUNT(*) AS c FROM stock")
+        if cur.fetchone()["c"] == 0:
+            for f in FLAVORS:
+                con.execute("INSERT OR REPLACE INTO stock(flavor_id, qty) VALUES(?, ?)", (f.id, 5))
+        con.commit()
 
-STOCK: Dict[str, int] = load_stock()
+def get_stock(flavor_id: int) -> int:
+    with db() as con:
+        row = con.execute("SELECT qty FROM stock WHERE flavor_id=?", (flavor_id,)).fetchone()
+        return int(row["qty"]) if row else 0
 
-def item_key(volume: str, flavor: str) -> str:
-    return f"{volume}|{flavor}"
+def set_stock(flavor_id: int, qty: int) -> None:
+    with db() as con:
+        con.execute("INSERT OR REPLACE INTO stock(flavor_id, qty) VALUES(?, ?)", (flavor_id, qty))
+        con.commit()
 
-def parse_item_key(k: str) -> Tuple[str, str]:
-    vol, flav = k.split("|", 1)
-    return vol, flav
+def add_cart(user_id: int, flavor_id: int, add_qty: int) -> None:
+    with db() as con:
+        row = con.execute("SELECT qty FROM carts WHERE user_id=? AND flavor_id=?", (user_id, flavor_id)).fetchone()
+        if row:
+            new_qty = int(row["qty"]) + add_qty
+            if new_qty <= 0:
+                con.execute("DELETE FROM carts WHERE user_id=? AND flavor_id=?", (user_id, flavor_id))
+            else:
+                con.execute("UPDATE carts SET qty=? WHERE user_id=? AND flavor_id=?", (new_qty, user_id, flavor_id))
+        else:
+            if add_qty > 0:
+                con.execute("INSERT INTO carts(user_id, flavor_id, qty) VALUES(?, ?, ?)", (user_id, flavor_id, add_qty))
+        con.commit()
 
-def flavor_desc(flavor: str) -> str:
-    for name, desc in FLAVORS:
-        if name == flavor:
-            return desc
-    return "Опис скоро буде 🙂"
+def get_cart(user_id: int) -> List[Tuple[int, int]]:
+    with db() as con:
+        rows = con.execute("SELECT flavor_id, qty FROM carts WHERE user_id=? ORDER BY flavor_id", (user_id,)).fetchall()
+        return [(int(r["flavor_id"]), int(r["qty"])) for r in rows]
 
-# -----------------------------
-# Корзина в user_data
-# -----------------------------
-def get_cart(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, int]:
-    cart = context.user_data.get("cart")
-    if not isinstance(cart, dict):
-        cart = {}
-        context.user_data["cart"] = cart
-    return cart
+def clear_cart(user_id: int) -> None:
+    with db() as con:
+        con.execute("DELETE FROM carts WHERE user_id=?", (user_id,))
+        con.commit()
 
-def cart_total_items(cart: Dict[str, int]) -> int:
-    return sum(int(q) for q in cart.values())
+def set_setting(key: str, value: str) -> None:
+    with db() as con:
+        con.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", (key, value))
+        con.commit()
 
-# -----------------------------
-# UI клавіатури
-# -----------------------------
+def get_setting(key: str) -> Optional[str]:
+    with db() as con:
+        row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return str(row["value"]) if row else None
+
+
+# =======================
+# PHOTO helper
+# =======================
+def get_product_photo() -> Optional[str]:
+    """
+    Return either:
+    - Telegram file_id (saved in DB) OR
+    - PHOTO_URL from env
+    """
+    file_id = get_setting("PHOTO_FILE_ID")
+    if file_id:
+        return file_id
+    if PHOTO_URL:
+        return PHOTO_URL
+    return None
+
+
+# =======================
+# UI builders
+# =======================
 def kb_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛒 Відкрити магазин", callback_data="open_shop")],
-        [InlineKeyboardButton("🧺 Корзина", callback_data="cart")],
+        [InlineKeyboardButton("Chaser 30 мл", callback_data="menu:flavors")],
+        [InlineKeyboardButton("🧺 Корзина", callback_data="menu:cart")],
     ])
 
-def kb_choose_volume() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Cheezer 30 мл", callback_data="vol:30")],
-        [InlineKeyboardButton("Cheezer 10 мл", callback_data="vol:10")],
-        [InlineKeyboardButton("🧺 Корзина", callback_data="cart")],
-    ])
-
-def kb_flavors(volume: str) -> InlineKeyboardMarkup:
-    rows = []
-    for name, _ in FLAVORS:
-        k = item_key(volume, name)
-        qty = int(STOCK.get(k, 0))
+def kb_flavors() -> InlineKeyboardMarkup:
+    buttons = []
+    for f in FLAVORS:
+        qty = get_stock(f.id)
         if qty <= 0:
-            continue  # немає на складі — кнопки нема
-        rows.append([InlineKeyboardButton(f"{name} ({qty} шт.)", callback_data=f"item:{k}")])
+            continue  # автоматично ховаємо зі списку
+        tag = f" ✅ {f.tag}" if f.tag else ""
+        text = f"{f.name}{tag} ({qty} шт.)"
+        buttons.append([InlineKeyboardButton(text, callback_data=f"flavor:{f.id}")])
+    buttons.append([InlineKeyboardButton("🧺 Корзина", callback_data="menu:cart")])
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="menu:main")])
+    return InlineKeyboardMarkup(buttons)
 
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="open_shop")])
-    rows.append([InlineKeyboardButton("🧺 Корзина", callback_data="cart")])
-    return InlineKeyboardMarkup(rows)
-
-def kb_item_actions(k: str) -> InlineKeyboardMarkup:
-    vol, flav = parse_item_key(k)
-    qty = int(STOCK.get(k, 0))
+def kb_flavor_detail(flavor_id: int) -> InlineKeyboardMarkup:
+    qty = get_stock(flavor_id)
+    can_add = qty > 0
+    row1 = []
+    if can_add:
+        row1.append(InlineKeyboardButton("➕ В корзину", callback_data=f"cart:add:{flavor_id}"))
+    row1.append(InlineKeyboardButton("🧺 Корзина", callback_data="menu:cart"))
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Додати в корзину", callback_data=f"add:{k}")],
-        [InlineKeyboardButton("🧺 Корзина", callback_data="cart")],
-        [InlineKeyboardButton("⬅️ До смаків", callback_data=f"vol:{vol}")],
-        [InlineKeyboardButton(f"ℹ️ В наявності: {qty} шт.", callback_data="noop")],
+        row1,
+        [InlineKeyboardButton("⬅️ До смаків", callback_data="menu:flavors")],
     ])
 
-def kb_cart(cart: Dict[str, int]) -> InlineKeyboardMarkup:
-    rows = []
+def kb_cart(user_id: int) -> InlineKeyboardMarkup:
+    cart = get_cart(user_id)
+    buttons = []
+    for fid, q in cart:
+        f = FLAVOR_BY_ID.get(fid)
+        if not f:
+            continue
+        buttons.append([
+            InlineKeyboardButton("➖", callback_data=f"cart:dec:{fid}"),
+            InlineKeyboardButton(f"{f.name} x{q}", callback_data=f"flavor:{fid}"),
+            InlineKeyboardButton("➕", callback_data=f"cart:inc:{fid}"),
+        ])
     if cart:
-        # кнопки мінус для кожної позиції
-        for k, q in cart.items():
-            vol, flav = parse_item_key(k)
-            rows.append([
-                InlineKeyboardButton(f"➖ {vol}мл · {flav} (x{q})", callback_data=f"rm:{k}")
-            ])
-        rows.append([InlineKeyboardButton("✅ Замовити", callback_data="checkout")])
-        rows.append([InlineKeyboardButton("🗑 Очистити корзину", callback_data="clear_cart")])
-    rows.append([InlineKeyboardButton("🛒 До магазину", callback_data="open_shop")])
-    return InlineKeyboardMarkup(rows)
+        buttons.append([InlineKeyboardButton("✅ Оформити замовлення", callback_data="order:checkout")])
+        buttons.append([InlineKeyboardButton("🗑 Очистити корзину", callback_data="cart:clear")])
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="menu:main")])
+    return InlineKeyboardMarkup(buttons)
 
-# -----------------------------
+
+# =======================
 # Handlers
-# -----------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =======================
+def is_admin(update: Update) -> bool:
+    uid = update.effective_user.id if update.effective_user else 0
+    return uid == ADMIN_CHAT_ID
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "Привіт! 👋\n"
-        "Вибери товар і додай у корзину, а потім натисни *Замовити*."
+        "Вибери товар:"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_main())
+    await update.message.reply_text(text, reply_markup=kb_main())
 
-async def shop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🛒 Магазин: обери об'єм", reply_markup=kb_choose_volume())
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    txt = (
+        "Команди:\n"
+        "/start — меню\n"
+        "\nАдмін:\n"
+        "/list — список смаків з ID\n"
+        "/stock — склад\n"
+        "/setstock <id> <кількість>\n"
+        "/setphoto — (відповісти на фото) встановити фото товарів\n"
+    )
+    await update.message.reply_text(txt)
 
-async def stock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # показ складу (тільки адміну)
-    if update.effective_user.id != ADMIN_CHAT_ID:
-        await update.message.reply_text("⛔️ Команда доступна тільки адміну.")
+async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update):
+        return
+    lines = ["Смаки Chaser 30 мл (ID):"]
+    for f in FLAVORS:
+        tag = f" ✅ {f.tag}" if f.tag else ""
+        lines.append(f"{f.id}. {f.name}{tag}")
+    await update.message.reply_text("\n".join(lines))
+
+async def stock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update):
+        return
+    lines = ["📦 Склад (30 мл):"]
+    for f in FLAVORS:
+        lines.append(f"• {f.id}. {f.name}: {get_stock(f.id)}")
+    await update.message.reply_text("\n".join(lines))
+
+async def setstock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update):
         return
 
-    lines = ["📦 *Склад:*"]
-    for vol in ("30", "10"):
-        lines.append(f"\n*{vol} мл*")
-        for name, _ in FLAVORS:
-            k = item_key(vol, name)
-            lines.append(f"• {name}: `{int(STOCK.get(k, 0))}`")
-    lines.append("\nКоманди:\n`/setstock 30|банан 10`\n`/addstock 10|мята 5`")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-
-async def setstock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_CHAT_ID:
-        await update.message.reply_text("⛔️ Тільки адмін.")
-        return
-    if len(context.args) < 2:
-        await update.message.reply_text("Формат: /setstock 30|банан 10")
+    # /setstock <id> <qty>
+    if len(context.args) != 2:
+        await update.message.reply_text("Формат: /setstock <id> <кількість>\nНапр: /setstock 7 20")
         return
 
-    k = context.args[0]
     try:
+        fid = int(context.args[0])
         qty = int(context.args[1])
     except ValueError:
-        await update.message.reply_text("Кількість має бути числом.")
+        await update.message.reply_text("ID і кількість мають бути числами. Напр: /setstock 7 20")
         return
 
-    STOCK[k] = max(0, qty)
-    save_stock(STOCK)
-    await update.message.reply_text(f"✅ Встановлено {k} = {STOCK[k]}")
-
-async def addstock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_CHAT_ID:
-        await update.message.reply_text("⛔️ Тільки адмін.")
-        return
-    if len(context.args) < 2:
-        await update.message.reply_text("Формат: /addstock 30|банан 5")
+    if fid not in FLAVOR_BY_ID:
+        await update.message.reply_text("Нема такого ID. Дивись /list")
         return
 
-    k = context.args[0]
-    try:
-        add = int(context.args[1])
-    except ValueError:
-        await update.message.reply_text("Кількість має бути числом.")
+    if qty < 0:
+        qty = 0
+
+    set_stock(fid, qty)
+    await update.message.reply_text(f"✅ Встановлено: {fid}. {FLAVOR_BY_ID[fid].name} = {qty}")
+
+async def setphoto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update):
+        return
+    if not update.message.reply_to_message or not update.message.reply_to_message.photo:
+        await update.message.reply_text("Зроби так: відправ фото сюди і ВІДПОВІДЬ на нього командою /setphoto")
+        return
+    file_id = update.message.reply_to_message.photo[-1].file_id
+    set_setting("PHOTO_FILE_ID", file_id)
+    await update.message.reply_text("✅ Фото встановлено. Тепер воно буде під кожним товаром.")
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+
+    user = update.effective_user
+    user_id = user.id
+
+    data = q.data or ""
+
+    # MENU
+    if data == "menu:main":
+        await q.edit_message_text("Вибери товар:", reply_markup=kb_main())
         return
 
-    STOCK[k] = max(0, int(STOCK.get(k, 0)) + add)
-    save_stock(STOCK)
-    await update.message.reply_text(f"✅ Додано. Тепер {k} = {STOCK[k]}")
-
-async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    data = query.data or ""
-    cart = get_cart(context)
-
-    if data == "noop":
+    if data == "menu:flavors":
+        await q.edit_message_text("Смаки Chaser 30 мл (показує тільки те, що є на складі):", reply_markup=kb_flavors())
         return
 
-    if data in ("open_shop",):
-        await query.edit_message_text("🛒 Обери об'єм:", reply_markup=kb_choose_volume())
-        return
-
-    if data.startswith("vol:"):
-        vol = data.split(":", 1)[1]
-        await query.edit_message_text(f"Смаки Cheezer {vol} мл (показує тільки те, що є на складі):",
-                                      reply_markup=kb_flavors(vol))
-        return
-
-    if data.startswith("item:"):
-        k = data.split(":", 1)[1]
-        vol, flav = parse_item_key(k)
-        qty = int(STOCK.get(k, 0))
-        if qty <= 0:
-            await query.edit_message_text("😕 Цього товару вже немає на складі.", reply_markup=kb_choose_volume())
-            return
-        desc = flavor_desc(flav)
-        text = (
-            f"*{flav}* — *{vol} мл*\n"
-            f"{desc}\n\n"
-            f"📦 В наявності: *{qty}* шт.\n"
-            f"🧺 У корзині всього: *{cart_total_items(cart)}*"
-        )
-        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_item_actions(k))
-        return
-
-    if data.startswith("add:"):
-        k = data.split(":", 1)[1]
-        available = int(STOCK.get(k, 0))
-        in_cart = int(cart.get(k, 0))
-        if available <= 0:
-            await query.edit_message_text("😕 Немає в наявності.", reply_markup=kb_choose_volume())
-            return
-        if in_cart >= available:
-            await query.answer("Ліміт: більше немає на складі.", show_alert=True)
-            return
-        cart[k] = in_cart + 1
-
-        vol, flav = parse_item_key(k)
-        await query.answer(f"Додано в корзину: {flav} {vol}мл")
-        # оновимо карточку товару
-        desc = flavor_desc(flav)
-        text = (
-            f"*{flav}* — *{vol} мл*\n"
-            f"{desc}\n\n"
-            f"📦 В наявності: *{available}* шт.\n"
-            f"✅ Додано в корзину. Тепер у корзині цього: *{cart[k]}*\n"
-            f"🧺 У корзині всього: *{cart_total_items(cart)}*"
-        )
-        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_item_actions(k))
-        return
-
-    if data == "cart":
+    if data == "menu:cart":
+        cart = get_cart(user_id)
         if not cart:
-            await query.edit_message_text("🧺 Корзина порожня.", reply_markup=kb_cart(cart))
-            return
-        lines = ["🧺 *Твоя корзина:*"]
-        for k, q in cart.items():
-            vol, flav = parse_item_key(k)
-            lines.append(f"• {vol} мл — {flav} × *{q}*")
-        lines.append("\nНатисни ✅ *Замовити* коли готово.")
-        await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=kb_cart(cart))
-        return
-
-    if data.startswith("rm:"):
-        k = data.split(":", 1)[1]
-        if k in cart:
-            cart[k] = int(cart[k]) - 1
-            if cart[k] <= 0:
-                cart.pop(k, None)
-        await query.answer("Прибрано 1 шт.")
-        # перерендер корзини
-        if not cart:
-            await query.edit_message_text("🧺 Корзина порожня.", reply_markup=kb_cart(cart))
+            await q.edit_message_text("🧺 Корзина порожня.", reply_markup=kb_main())
         else:
-            lines = ["🧺 *Твоя корзина:*"]
-            for kk, q in cart.items():
-                vol, flav = parse_item_key(kk)
-                lines.append(f"• {vol} мл — {flav} × *{q}*")
-            lines.append("\nНатисни ✅ *Замовити* коли готово.")
-            await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=kb_cart(cart))
+            # summary text
+            lines = ["🧺 Твоя корзина:"]
+            for fid, qty in cart:
+                f = FLAVOR_BY_ID.get(fid)
+                if f:
+                    lines.append(f"• {f.name} x{qty}")
+            await q.edit_message_text("\n".join(lines), reply_markup=kb_cart(user_id))
         return
 
-    if data == "clear_cart":
-        cart.clear()
-        await query.edit_message_text("🧺 Корзина очищена.", reply_markup=kb_cart(cart))
-        return
-
-    if data == "checkout":
-        if not cart:
-            await query.answer("Корзина порожня.", show_alert=True)
+    # FLAVOR DETAIL
+    if data.startswith("flavor:"):
+        fid = int(data.split(":")[1])
+        f = FLAVOR_BY_ID.get(fid)
+        if not f:
+            await q.edit_message_text("Не знайдено.", reply_markup=kb_flavors())
             return
 
-        # перевірка складу ще раз (щоб не замовили більше, ніж є)
-        for k, q in list(cart.items()):
-            available = int(STOCK.get(k, 0))
-            if q > available:
-                vol, flav = parse_item_key(k)
-                await query.answer(f"Немає стільки на складі: {flav} {vol}мл (є {available})", show_alert=True)
+        qty = get_stock(fid)
+        tag = f" ✅ {f.tag}" if f.tag else ""
+        caption = (
+            f"*Chaser 30 мл*\n"
+            f"*{f.name}{tag}*\n\n"
+            f"{f.desc}\n\n"
+            f"На складі: {qty} шт."
+        )
+
+        photo = get_product_photo()
+        if photo:
+            # If current message has no photo, better to send a new photo message.
+            # We'll try edit media if possible, else send new and delete old.
+            try:
+                await q.edit_message_media(
+                    media=InputMediaPhoto(media=photo, caption=caption, parse_mode="Markdown"),
+                    reply_markup=kb_flavor_detail(fid),
+                )
+            except Exception:
+                await q.message.delete()
+                await context.bot.send_photo(
+                    chat_id=q.message.chat_id,
+                    photo=photo,
+                    caption=caption,
+                    parse_mode="Markdown",
+                    reply_markup=kb_flavor_detail(fid),
+                )
+        else:
+            await q.edit_message_text(caption, parse_mode="Markdown", reply_markup=kb_flavor_detail(fid))
+        return
+
+    # CART OPS
+    if data.startswith("cart:add:"):
+        fid = int(data.split(":")[2])
+        if get_stock(fid) <= 0:
+            await q.answer("Немає на складі.", show_alert=True)
+            return
+        add_cart(user_id, fid, 1)
+        await q.answer("Додано в корзину ✅", show_alert=False)
+        # refresh detail
+        await on_callback(update, context)
+        return
+
+    if data.startswith("cart:inc:"):
+        fid = int(data.split(":")[2])
+        # дозволяємо додати тільки якщо є залишок
+        current_in_cart = dict(get_cart(user_id)).get(fid, 0)
+        if current_in_cart + 1 > get_stock(fid):
+            await q.answer("Більше нема на складі.", show_alert=True)
+            return
+        add_cart(user_id, fid, 1)
+        await q.edit_message_text("🧺 Твоя корзина:", reply_markup=kb_cart(user_id))
+        return
+
+    if data.startswith("cart:dec:"):
+        fid = int(data.split(":")[2])
+        add_cart(user_id, fid, -1)
+        cart = get_cart(user_id)
+        if not cart:
+            await q.edit_message_text("🧺 Корзина порожня.", reply_markup=kb_main())
+        else:
+            await q.edit_message_text("🧺 Твоя корзина:", reply_markup=kb_cart(user_id))
+        return
+
+    if data == "cart:clear":
+        clear_cart(user_id)
+        await q.edit_message_text("🧺 Корзина очищена.", reply_markup=kb_main())
+        return
+
+    # CHECKOUT
+    if data == "order:checkout":
+        cart = get_cart(user_id)
+        if not cart:
+            await q.answer("Корзина порожня.", show_alert=True)
+            return
+
+        # перевірка складу перед списанням
+        for fid, qty in cart:
+            if qty > get_stock(fid):
+                await q.answer("Хтось уже забрав частину товару. Онови корзину.", show_alert=True)
                 return
 
         # списуємо зі складу
-        for k, q in cart.items():
-            STOCK[k] = max(0, int(STOCK.get(k, 0)) - int(q))
-        save_stock(STOCK)
+        for fid, qty in cart:
+            set_stock(fid, get_stock(fid) - qty)
 
-        # формуємо повідомлення адміна з клікабельним профілем (працює навіть без username)
-        user = update.effective_user
-        mention = user.mention_html()  # клікабельне ім'я
-        user_id = user.id
+        # формуємо повідомлення адміну з "профілем"
+        u = update.effective_user
+        full_name = (u.full_name or "").strip()
+        username = f"@{u.username}" if u.username else "(нема username)"
+        mention = f"[{full_name}](tg://user?id={u.id})" if full_name else f"[Клієнт](tg://user?id={u.id})"
 
-        order_lines = ["🛎️ <b>НОВЕ ЗАМОВЛЕННЯ</b>"]
-        order_lines.append(f"👤 Клієнт: {mention}")
-        order_lines.append(f"🆔 ID: <code>{user_id}</code>")
+        lines = [
+            "🛒 *НОВЕ ЗАМОВЛЕННЯ*",
+            f"Клієнт: {mention}",
+            f"ID: `{u.id}`",
+            f"Username: {username}",
+            "",
+            "*Позиції:*",
+        ]
+        for fid, qty in cart:
+            f = FLAVOR_BY_ID.get(fid)
+            if f:
+                lines.append(f"• Chaser 30 мл — {f.name} x{qty}")
 
-        if user.username:
-            order_lines.append(f"🔗 Username: @{user.username}")
+        msg_admin = "\n".join(lines)
 
-        order_lines.append("\n<b>Позиції:</b>")
-        for k, q in cart.items():
-            vol, flav = parse_item_key(k)
-            order_lines.append(f"• {vol} мл — {flav} × <b>{q}</b>")
-
-        # надсилаємо адміну
+        # шлем адміну
         await context.bot.send_message(
             chat_id=ADMIN_CHAT_ID,
-            text="\n".join(order_lines),
-            parse_mode=ParseMode.HTML,
+            text=msg_admin,
+            parse_mode="Markdown",
             disable_web_page_preview=True,
         )
 
-        # клієнту — підтвердження
-        cart.clear()
-        await query.edit_message_text(
-            "✅ *Замовлення прийнято!*\n"
-            "Чекайте повідомлення від менеджера 🙂",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_main(),
-        )
+        # чистимо корзину
+        clear_cart(user_id)
+
+        # відповідь клієнту
+        await q.edit_message_text("✅ Замовлення прийнято! Чекайте повідомлення від менеджера.", reply_markup=kb_main())
         return
 
-    # якщо натиснули щось невідоме
-    await query.answer("Невідома дія.")
+    # fallback
+    await q.answer("Невідома дія.", show_alert=False)
 
-def main():
+
+# =======================
+# MAIN
+# =======================
+def main() -> None:
+    init_db()
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("shop", shop_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
 
-    # адмінські:
+    # admin commands
+    app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(CommandHandler("stock", stock_cmd))
     app.add_handler(CommandHandler("setstock", setstock_cmd))
-    app.add_handler(CommandHandler("addstock", addstock_cmd))
+    app.add_handler(CommandHandler("setphoto", setphoto_cmd))
 
-    app.add_handler(CallbackQueryHandler(on_cb))
+    app.add_handler(CallbackQueryHandler(on_callback))
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
